@@ -432,6 +432,10 @@ class AsyncioSubscriptionManager(SubscriptionManager):
     def reconnect(self):
         # TODO: method is synchronized in Java
         self._should_stop = False
+        # Clear the one-shot latch so the next successful subscribe announces
+        # PNConnectedCategory again. Without this no connection status is ever
+        # announced after a reconnect.
+        self._subscription_status_announced = False
         self._subscribe_loop_task = asyncio.ensure_future(self._start_subscribe_loop())
         self._register_heartbeat_timer()
 

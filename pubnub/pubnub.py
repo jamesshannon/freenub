@@ -270,6 +270,10 @@ class NativeSubscriptionManager(SubscriptionManager):
 
     def reconnect(self):
         self._should_stop = False
+        # Clear the one-shot latch so the next successful subscribe announces
+        # PNConnectedCategory again. Without this no connection status is ever
+        # announced after a reconnect.
+        self._subscription_status_announced = False
         self._start_subscribe_loop()
         # Check the instance flag to determine if we want to perform the presence heartbeat
         # This is False by default
