@@ -429,13 +429,15 @@ class AsyncioSubscriptionManager(SubscriptionManager):
             consumer.run(), loop=self._pubnub.event_loop
         )
 
-    def reconnect(self):
+    def reconnect(self, announce_status=True):
         # TODO: method is synchronized in Java
         self._should_stop = False
-        # Clear the one-shot latch so the next successful subscribe announces
-        # PNConnectedCategory again. Without this no connection status is ever
-        # announced after a reconnect.
-        self._subscription_status_announced = False
+        if announce_status:
+            # Clear the one-shot latch so the next successful subscribe
+            # announces PNConnectedCategory again. Callers that only restart
+            # the loop (adapt_unsubscribe_builder, adapt_state_builder) pass
+            # announce_status=False.
+            self._subscription_status_announced = False
         self._subscribe_loop_task = asyncio.ensure_future(self._start_subscribe_loop())
         self._register_heartbeat_timer()
 

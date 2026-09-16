@@ -5,6 +5,11 @@ guards the only place `PNConnectedCategory` is announced. `reconnect()` must
 clear it, otherwise a caller that reconnects gets a working subscribe loop and
 no further connection status for the lifetime of the manager.
 
+`reconnect()` also doubles as the internal restart primitive for
+`adapt_unsubscribe_builder` and `adapt_state_builder`. Those pass
+`announce_status=False`, so a partial unsubscribe or a `set_state()` restarts
+the loop without reporting a connection that never dropped.
+
 Both managers are driven through a stubbed `Subscribe` endpoint so no network
 traffic is involved.
 """
@@ -335,13 +340,11 @@ async def test_on_reconnect_announces_reconnected_without_duplicate(async_client
 
 
 @pytest.mark.asyncio
-async def test_partial_unsubscribe_announces_connected(async_client):
-    """`adapt_unsubscribe_builder` routes through `reconnect()`.
+async def test_partial_unsubscribe_announces_nothing(async_client):
+    """`adapt_unsubscribe_builder` restarts the loop without re-announcing.
 
-    Dropping one of two channels leaves a live subscription, and the reset
-    makes that re-announce `PNConnectedCategory` — symmetric with
-    `adapt_subscribe_builder`, which already clears the latch when a channel is
-    added to a live subscription.
+    Dropping one of two channels leaves a live subscription. The channels that
+    remain were already connected, so there is no new subscription to report.
     """
     pubnub, recorder, stub = async_client
 
@@ -355,21 +358,27 @@ async def test_partial_unsubscribe_announces_connected(async_client):
     await asyncio.sleep(SETTLE)
     await deliver_subscribe_response(stub, timetoken=1001)
 
-    assert recorder.categories == [PNStatusCategory.PNConnectedCategory]
+    assert recorder.categories == []
 
 
 @pytest.mark.asyncio
-async def test_reconnect_clears_the_latch(async_client):
+async def test_set_state_announces_nothing(async_client):
+    """`SetState.custom_params` calls `adapt_state_builder` on every request.
+
+    Writing presence state is not a connection event, so the restart it
+    triggers must not re-announce.
+    """
     pubnub, recorder, stub = async_client
 
     pubnub.subscribe().channels([CHANNEL]).execute()
     await deliver_subscribe_response(stub, timetoken=1000)
-    manager = pubnub._subscription_manager
-    assert manager._subscription_status_announced is True
+    recorder.categories.clear()
 
-    manager.reconnect()
+    pubnub.set_state().channels([CHANNEL]).state({"mood": "ok"}).custom_params()
+    await asyncio.sleep(SETTLE)
+    await deliver_subscribe_response(stub, timetoken=1001)
 
-    assert manager._subscription_status_announced is False
+    assert recorder.categories == []
 
 
 @pytest.mark.asyncio
@@ -474,7 +483,7 @@ def test_native_on_reconnect_announces_reconnected_without_duplicate(native_clie
     assert recorder.categories == [PNStatusCategory.PNReconnectedCategory]
 
 
-def test_native_partial_unsubscribe_announces_connected(native_client):
+def test_native_partial_unsubscribe_announces_nothing(native_client):
     pubnub, recorder, stub = native_client
 
     pubnub.subscribe().channels([CHANNEL, OTHER_CHANNEL]).execute()
@@ -486,20 +495,20 @@ def test_native_partial_unsubscribe_announces_connected(native_client):
     )
     deliver_native_response(stub, timetoken=1001)
 
-    assert recorder.categories == [PNStatusCategory.PNConnectedCategory]
+    assert recorder.categories == []
 
 
-def test_native_reconnect_clears_the_latch(native_client):
+def test_native_set_state_announces_nothing(native_client):
     pubnub, recorder, stub = native_client
 
     pubnub.subscribe().channels([CHANNEL]).execute()
     deliver_native_response(stub, timetoken=1000)
-    manager = pubnub._subscription_manager
-    assert manager._subscription_status_announced is True
+    recorder.categories.clear()
 
-    manager.reconnect()
+    pubnub.set_state().channels([CHANNEL]).state({"mood": "ok"}).custom_params()
+    deliver_native_response(stub, timetoken=1001)
 
-    assert manager._subscription_status_announced is False
+    assert recorder.categories == []
 
 
 def test_native_reconnect_restarts_the_subscribe_loop(native_client):

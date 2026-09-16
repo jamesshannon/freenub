@@ -268,12 +268,14 @@ class NativeSubscriptionManager(SubscriptionManager):
     def _message_queue_put(self, message):
         self._message_queue.put(message)
 
-    def reconnect(self):
+    def reconnect(self, announce_status=True):
         self._should_stop = False
-        # Clear the one-shot latch so the next successful subscribe announces
-        # PNConnectedCategory again. Without this no connection status is ever
-        # announced after a reconnect.
-        self._subscription_status_announced = False
+        if announce_status:
+            # Clear the one-shot latch so the next successful subscribe
+            # announces PNConnectedCategory again. Callers that only restart
+            # the loop (adapt_unsubscribe_builder, adapt_state_builder) pass
+            # announce_status=False.
+            self._subscription_status_announced = False
         self._start_subscribe_loop()
         # Check the instance flag to determine if we want to perform the presence heartbeat
         # This is False by default

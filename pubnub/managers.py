@@ -336,14 +336,14 @@ class SubscriptionManager:
         if self._subscription_state.is_empty():
             self._region = None
             self._timetoken = 0
-        self.reconnect()
+        self.reconnect(announce_status=False)
 
     def adapt_state_builder(self, state_operation):
         self._subscription_state.adapt_state_builder(state_operation)
-        self.reconnect()
+        self.reconnect(announce_status=False)
 
     @abstractmethod
-    def reconnect(self):
+    def reconnect(self, announce_status=True):
         pass
 
     def stop(self):
