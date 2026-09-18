@@ -37,7 +37,9 @@ CHANNEL = "test-channel"
 PRESENCE_TIMEOUT = 20
 HEARTBEAT_INTERVAL = 0.1
 
-# Long enough for at least one heartbeat fire at the interval above.
+# How long the tests that assert an *absence* wait before concluding nothing
+# fired. Tests that assert a heartbeat did happen poll instead; see
+# `wait_for_calls`.
 HEARTBEAT_WINDOW = 0.35
 
 # Time for the subscribe loop to get as far as its first request.
@@ -77,7 +79,10 @@ class ParkedSubscribeStub:
     populated by `adapt_subscribe_builder`, which is all the heartbeat needs.
     """
 
+    calls = 0
+
     def __init__(self, pubnub):
+        type(self).calls += 1
         self._pubnub = pubnub
 
     def channels(self, channels):
@@ -165,8 +170,41 @@ class HeartbeatStub:
         return ParkedNativeCall()
 
 
+async def wait_for_calls(minimum, timeout=2.0):
+    """Wait for `minimum` heartbeat requests rather than for a fixed window."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while HeartbeatStub.calls < minimum:
+        assert loop.time() < deadline, (
+            f"only {HeartbeatStub.calls} heartbeats in {timeout}s"
+        )
+        await asyncio.sleep(0.01)
+
+
+def assert_subscribe_loop_alive(pubnub):
+    """A negative heartbeat assertion means nothing if the subscribe loop died.
+
+    `_start_subscribe_loop` is fire-and-forget, so a stub that no longer matches
+    `Subscribe` kills it without reaching any listener, and every `calls == 0` or
+    `categories == []` below then passes vacuously. It also dies holding
+    `_subscription_lock`, which leaves the next loop blocked rather than failed,
+    so check that the loop is parked on a request and not merely undead.
+    """
+    manager = pubnub._subscription_manager
+    loop_task = manager._subscribe_loop_task
+    if loop_task is not None and loop_task.done() and not loop_task.cancelled():
+        assert loop_task.exception() is None, (
+            f"subscribe loop raised: {loop_task.exception()!r}"
+        )
+    request = manager._subscribe_request_task
+    assert request is not None and not request.done(), (
+        "subscribe loop is not parked on a request"
+    )
+
+
 @pytest.fixture
 def stub_endpoints(monkeypatch):
+    ParkedSubscribeStub.calls = 0
     HeartbeatStub.calls = 0
     HeartbeatStub.response = staticmethod(heartbeat_success)
     monkeypatch.setattr(pubnub_asyncio, "Subscribe", ParkedSubscribeStub)
@@ -207,6 +245,7 @@ async def test_subscribe_registers_no_heartbeat_timer_by_default(
     pubnub.subscribe().channels([CHANNEL]).execute()
     await asyncio.sleep(SETTLE)
 
+    assert_subscribe_loop_alive(pubnub)
     assert pubnub._subscription_manager._heartbeat_periodic_callback is None
 
 
@@ -225,6 +264,25 @@ async def test_subscribe_registers_heartbeat_timer_when_enabled(
 
 
 @pytest.mark.asyncio
+async def test_truthy_flag_registers_heartbeat_timer(async_client_factory):
+    """Opting in with a truthy non-bool works.
+
+    `enable_presence_heartbeat` is a plain attribute with no validation
+    (`pubnub/pnconfiguration.py:35`), so a value parsed from the environment or
+    from JSON arrives as `1` or `"true"`. An identity check against `True` would
+    read those as opting out and disable the heartbeat with no way to tell from
+    the outside.
+    """
+    pubnub, _ = async_client_factory()
+    pubnub.config.enable_presence_heartbeat = 1
+
+    pubnub.subscribe().channels([CHANNEL]).execute()
+    await wait_for_calls(1)
+
+    assert pubnub._subscription_manager._heartbeat_periodic_callback is not None
+
+
+@pytest.mark.asyncio
 async def test_reconnect_registers_no_heartbeat_timer_by_default(
     async_client_factory,
 ):
@@ -236,6 +294,7 @@ async def test_reconnect_registers_no_heartbeat_timer_by_default(
     pubnub.reconnect()
     await asyncio.sleep(SETTLE)
 
+    assert_subscribe_loop_alive(pubnub)
     assert pubnub._subscription_manager._heartbeat_periodic_callback is None
 
 
@@ -249,6 +308,7 @@ async def test_no_heartbeat_requests_sent_by_default(async_client_factory):
     pubnub.subscribe().channels([CHANNEL]).execute()
     await asyncio.sleep(HEARTBEAT_WINDOW)
 
+    assert_subscribe_loop_alive(pubnub)
     assert HeartbeatStub.calls == 0
 
 
@@ -258,7 +318,7 @@ async def test_heartbeat_requests_sent_when_enabled(async_client_factory):
     pubnub, _ = async_client_factory(enable_presence_heartbeat=True)
 
     pubnub.subscribe().channels([CHANNEL]).execute()
-    await asyncio.sleep(HEARTBEAT_WINDOW)
+    await wait_for_calls(1)
 
     assert HeartbeatStub.calls >= 1
 
@@ -269,6 +329,7 @@ def test_native_client_sends_no_heartbeat_requests_by_default(stub_endpoints):
     try:
         pubnub.subscribe().channels([CHANNEL]).execute()
 
+        assert ParkedSubscribeStub.calls >= 1, "subscribe loop issued no request"
         assert pubnub._subscription_manager._heartbeat_periodic_callback is None
         assert HeartbeatStub.calls == 0
     finally:
@@ -295,6 +356,7 @@ async def test_heartbeat_failure_not_announced_by_default(async_client_factory):
     pubnub.subscribe().channels([CHANNEL]).execute()
     await asyncio.sleep(HEARTBEAT_WINDOW)
 
+    assert_subscribe_loop_alive(pubnub)
     assert recorder.categories == []
 
 
@@ -309,7 +371,7 @@ async def test_heartbeat_failure_announced_when_enabled(async_client_factory):
     )
 
     pubnub.subscribe().channels([CHANNEL]).execute()
-    await asyncio.sleep(HEARTBEAT_WINDOW)
+    await wait_for_calls(1)
 
     assert PNStatusCategory.PNTimeoutCategory in recorder.categories
 
@@ -320,7 +382,7 @@ async def test_heartbeat_success_not_announced_when_enabled(async_client_factory
     pubnub, recorder = async_client_factory(enable_presence_heartbeat=True)
 
     pubnub.subscribe().channels([CHANNEL]).execute()
-    await asyncio.sleep(HEARTBEAT_WINDOW)
+    await wait_for_calls(1)
 
     assert HeartbeatStub.calls >= 1
     assert recorder.categories == []
