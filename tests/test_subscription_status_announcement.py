@@ -38,8 +38,9 @@ from pubnub.pubnub_asyncio import (
 CHANNEL = "test-channel"
 OTHER_CHANNEL = "other-channel"
 
-# Time for the asyncio subscribe loop to consume a queued response and
-# re-arm itself. Every await in that path is on an already-resolved future.
+# Time for the asyncio subscribe loop to restart itself, where there is no
+# response to key off. Every await in that path is on an already-resolved
+# future. Response delivery is signalled rather than timed; see `async_client`.
 SETTLE = 0.05
 
 
@@ -138,6 +139,22 @@ async def async_client(asyncio_subscribe):
     pubnub = PubNubAsyncio(make_config())
     recorder = StatusRecorder()
     pubnub.add_listener(recorder)
+
+    # Every assertion in this suite is about what the manager did with a
+    # response, so the stub signals from the manager side: an event set when
+    # the subscribe stub picks a response off the queue would fire before
+    # `_handle_endpoint_call` had announced anything.
+    manager = pubnub._subscription_manager
+    handled = asyncio.Event()
+    handle_endpoint_call = manager._handle_endpoint_call
+
+    def signal_when_handled(raw_result, status):
+        handle_endpoint_call(raw_result, status)
+        handled.set()
+
+    manager._handle_endpoint_call = signal_when_handled
+    asyncio_subscribe.handled = handled
+
     try:
         yield pubnub, recorder, asyncio_subscribe
     finally:
@@ -145,13 +162,18 @@ async def async_client(asyncio_subscribe):
 
 
 async def deliver_subscribe_response(stub, timetoken=1000):
-    """Hand the parked subscribe loop one successful response."""
+    """Hand the parked subscribe loop one successful response.
+
+    Returns once the manager has finished with it, so a missed wake-up fails as
+    a timeout rather than as a wrong-categories assertion.
+    """
+    stub.handled.clear()
     stub.queue.put_nowait(
         AsyncioEnvelope(
             result=empty_subscribe_payload(timetoken), status=success_status()
         )
     )
-    await asyncio.sleep(SETTLE)
+    await asyncio.wait_for(stub.handled.wait(), timeout=2)
 
 
 class NativeCallStub:
@@ -362,6 +384,28 @@ async def test_partial_unsubscribe_announces_nothing(async_client):
 
 
 @pytest.mark.asyncio
+async def test_unsubscribe_all_then_subscribe_announces_connected(async_client):
+    """A full unsubscribe drops the subscription, so the next one is new.
+
+    `adapt_unsubscribe_builder` passes `announce_status=False` and
+    `_start_subscribe_loop` returns early with no channels, so the latch is
+    left set. Only the `reconnect()` on the subscribe path clears it again.
+    """
+    pubnub, recorder, stub = async_client
+
+    pubnub.subscribe().channels([CHANNEL]).execute()
+    await deliver_subscribe_response(stub, timetoken=1000)
+    pubnub.unsubscribe_all()
+    await asyncio.sleep(SETTLE)
+    recorder.categories.clear()
+
+    pubnub.subscribe().channels([OTHER_CHANNEL]).execute()
+    await deliver_subscribe_response(stub, timetoken=1001)
+
+    assert recorder.categories == [PNStatusCategory.PNConnectedCategory]
+
+
+@pytest.mark.asyncio
 async def test_set_state_announces_nothing(async_client):
     """`SetState.custom_params` calls `adapt_state_builder` on every request.
 
@@ -483,6 +527,64 @@ def test_native_on_reconnect_announces_reconnected_without_duplicate(native_clie
     assert recorder.categories == [PNStatusCategory.PNReconnectedCategory]
 
 
+class SynchronousNativeSubscribeStub(NativeSubscribeStub):
+    """Answers one subscribe call on the calling thread.
+
+    The real handler answers on a worker thread
+    (`request_handlers/requests_handler.py:113`), so a response can land while
+    the caller of `reconnect()` is still running. This stub makes that ordering
+    reachable without depending on thread timing.
+    """
+
+    answer_synchronously = False
+
+    def pn_async(self, callback):
+        if not type(self).answer_synchronously:
+            return super().pn_async(callback)
+
+        type(self).answer_synchronously = False
+        type(self).request_count += 1
+        call = NativeCallStub()
+        call.is_executed = True
+        callback(empty_subscribe_payload(), success_status())
+        return call
+
+
+@pytest.fixture
+def synchronous_native_client(monkeypatch):
+    SynchronousNativeSubscribeStub.pending = []
+    SynchronousNativeSubscribeStub.request_count = 0
+    SynchronousNativeSubscribeStub.answer_synchronously = False
+    monkeypatch.setattr(pubnub_native, "Subscribe", SynchronousNativeSubscribeStub)
+
+    pubnub = PubNub(make_config())
+    recorder = StatusRecorder()
+    pubnub.add_listener(recorder)
+    try:
+        yield pubnub, recorder, SynchronousNativeSubscribeStub
+    finally:
+        pubnub._subscription_manager.stop()
+
+
+def test_native_on_reconnect_response_inside_the_window(synchronous_native_client):
+    """`on_reconnect` must not arm the announcement it is about to suppress.
+
+    It reports PNReconnectedCategory and sets the latch itself. If the restart
+    cleared the latch first, a subscribe response arriving before that
+    assignment would announce PNConnectedCategory as well.
+    """
+    pubnub, recorder, stub = synchronous_native_client
+
+    pubnub.subscribe().channels([CHANNEL]).execute()
+    deliver_native_response(stub, timetoken=1000)
+    recorder.categories.clear()
+
+    stub.answer_synchronously = True
+    pubnub._subscription_manager._reconnection_listener.on_reconnect()
+
+    assert recorder.categories == [PNStatusCategory.PNReconnectedCategory]
+
+
 def test_native_partial_unsubscribe_announces_nothing(native_client):
     pubnub, recorder, stub = native_client
 
@@ -496,6 +598,20 @@ def test_native_partial_unsubscribe_announces_nothing(native_client):
     deliver_native_response(stub, timetoken=1001)
 
     assert recorder.categories == []
+
+
+def test_native_unsubscribe_all_then_subscribe_announces_connected(native_client):
+    pubnub, recorder, stub = native_client
+
+    pubnub.subscribe().channels([CHANNEL]).execute()
+    deliver_native_response(stub, timetoken=1000)
+    pubnub.unsubscribe_all()
+    recorder.categories.clear()
+
+    pubnub.subscribe().channels([OTHER_CHANNEL]).execute()
+    deliver_native_response(stub, timetoken=1001)
+
+    assert recorder.categories == [PNStatusCategory.PNConnectedCategory]
 
 
 def test_native_set_state_announces_nothing(native_client):

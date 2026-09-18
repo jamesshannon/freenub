@@ -188,12 +188,18 @@ class NativeSubscriptionManager(SubscriptionManager):
 
         class NativeReconnectionCallback(ReconnectionCallback):
             def on_reconnect(self):
-                subscription_manager.reconnect()
+                # A recovered connection is reported as PNReconnectedCategory,
+                # so the subscribe loop is restarted without arming the
+                # PNConnectedCategory announcement.
+                subscription_manager.reconnect(announce_status=False)
 
                 pn_status = PNStatus()
                 pn_status.category = PNStatusCategory.PNReconnectedCategory
                 pn_status.error = False
 
+                # Still required: the latch is already clear if no subscribe has
+                # succeeded yet, which is the case when the connection was down
+                # from the start.
                 subscription_manager._subscription_status_announced = True
                 subscription_manager._listener_manager.announce_status(pn_status)
 

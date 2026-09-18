@@ -318,11 +318,12 @@ class SubscriptionManager:
     def adapt_subscribe_builder(self, subscribe_operation):
         assert isinstance(subscribe_operation, SubscribeOperation)
         self._subscription_state.adapt_subscribe_builder(subscribe_operation)
-        self._subscription_status_announced = False
 
         if subscribe_operation.timetoken is not None:
             self._timetoken = subscribe_operation.timetoken
 
+        # reconnect() clears the announcement latch by default, so a new
+        # subscription re-announces PNConnectedCategory on its own.
         self.reconnect()
 
     def adapt_unsubscribe_builder(self, unsubscribe_operation):
